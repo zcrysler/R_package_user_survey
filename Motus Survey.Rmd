@@ -1,0 +1,443 @@
+---
+title: "Motus R Package Review"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+In the next couple of months we will be releasing a basic R-package that will allow users to access their data directly from the Motus database. We plan to improve this package over time to include tools to manage, explore and analyze detection data. To ensure that the R package is tailored for the needs of Motus collaborators, please take some time to review some of the current functions.
+
+# Load R Packages
+
+First, we load some packages.  If you do not have these packages installed, you need to first install them using > install.packages("dplyr").
+
+```{r Load Packages, message = FALSE, warning = FALSE}
+require(dplyr)
+require(ggplot2)
+require(ggmap)
+require(RgoogleMaps)
+require(lubridate)
+require(sensorgnome)
+require(geosphere)
+require(knitr)
+require(pander)
+require(forcats)
+require(data.table)
+```
+Then, we'll manually set system time to UTC
+```{r}
+Sys.setenv(TZ='GMT')
+```
+# Getting Data
+
+```{r, message = FALSE, warning = FALSE}
+## read in detection data
+tags <- read.csv("./sample_data.csv")
+tags <- rename(tags, port = ant)
+## read in deployment data
+rec <- read.csv("./receiver-deployments.csv")
+## read in antenna data
+ant <- read.csv("./antenna-deployments.csv")
+
+## merge deployment, antenna, and receiver data
+## convert ts and mfgID column type
+tags <- full_join(rec, ant) %>% left_join(tags, .)
+tags <- mutate(tags, 
+               mfgID = factor(mfgID), 
+               ts = as_datetime(ts, tz = "UTC"))
+
+## keep only necessary columns
+tags <- select(tags, ts, sig, receiverID, motusRecvID, recvProjectID, 
+               port, motusTagID, mfgID, dateBin, tagProjectID, gpsLat, gpsLon, 
+               deploymentName, dtStart, dtEnd, latitude, longitude, antennaType,
+               bearing)
+```
+
+# Basic Data Manipulations
+Add sunrise/sunset times, as well as time to/from sunrise/sunset to detection files
+```{r sunrise function, echo = FALSE}
+
+## sunrise function
+sunr <- function(lon, lat, ts, dir = "sunrise") {
+  maptools::sunriset(as.matrix(data.frame(lon, lat)), ts, POSIXct.out=TRUE, direction=dir)$time
+}
+
+## sunset function
+suns <- function(lon, lat, ts, dir = "sunset") {
+  maptools::sunriset(as.matrix(data.frame(lon, lat)), ts, POSIXct.out=TRUE, direction=dir)$time
+}
+
+timeToSunriset <- function(data, units = "hours"){
+  cols <- c("latitude", "longitude", "ts") ## Select columns that can't contain NA values
+  loc_na <- data %>% filter(!complete.cases(.[cols])) ## new dataframe with NA values in lat, lon, or ts
+  loc <- data %>% filter(complete.cases(.[cols])) ## new dataframe with no NA values in lat, lon, or ts
+  
+  loc1 <- loc %>% mutate(sunrise = sunr(longitude, latitude, ts),
+                        sunset = suns(longitude, latitude, ts),
+                        ts_to_set = ifelse(ts < sunset, difftime(sunset, ts, units = units), 
+                                           difftime(suns(longitude, latitude, (ts + 86400)), ts, units = units)),
+                        ts_since_set = ifelse(ts > sunset, difftime(ts, sunset, units = units),
+                                              difftime(ts, suns(longitude, latitude, (ts - 86400)), units = units)),
+                        ts_to_rise = ifelse(ts < sunrise, difftime(sunrise, ts, units = units),
+                                            difftime(sunr(longitude, latitude, (ts + 86400)), ts, units = units)),
+                        ts_since_rise = ifelse(ts > sunrise, difftime(ts, sunrise, units = units),
+                                               difftime(ts, sunr(longitude, latitude, (ts - 86400)), units = units)))
+  data <- full_join(loc1, loc_na)
+  return(data)
+}
+```
+
+```{r sunrise, message = FALSE}
+sun <- timeToSunriset(tags, units = "mins")
+sun[72:76, c(1, 3, 16, 17, 20:25)]
+```
+Get dataframe of "transitions" - consecutive detections at different sites - for each tagID
+```{r site transitions function, echo = FALSE}
+consec.fun <- function(df) {
+  df <- arrange(df, ts)
+  a <- df$deploymentName[-length(df$deploymentName)]
+  b <- df$deploymentName[-1]
+  tmp <- c(0, 1 - (as.numeric(a==b)))
+  run <- cumsum(tmp)
+  transitions <- which(diff(run) != 0)
+  transitions <- c(transitions, transitions+1, length(df$deploymentName))
+  out.df <- df[transitions,]
+  out.df <- arrange(out.df, ts)
+  return(out.df)
+}
+
+site.fun <- function(df) {
+  df <- df %>% select(-mfgID) %>% arrange(ts)
+  out.df.x <- df[1:(length(df$deploymentName)-1), ]
+  names(out.df.x) <- paste(names(df), "x", sep=".")
+  out.df.y <- df[2:length(df$deploymentName), ]
+  names(out.df.y) <- paste(names(df), "y", sep=".")
+  out.df <- cbind(out.df.x, out.df.y)
+  out.df <- filter(out.df, ((deploymentName.x != deploymentName.y)))
+  return(out.df)
+}
+
+siteTrans <- function(data){
+  data <- select(data, ts, mfgID, latitude, longitude, deploymentName) ## get only relevant columns
+  data <- data %>% group_by(mfgID) %>% do(consec.fun(.))
+  data <- data %>% group_by(mfgID) %>% do(site.fun(.))
+  data <- data %>% rowwise() %>% 
+    mutate(tot_ts = difftime(ts.y, ts.x, units = "secs"),
+           dist = sensorgnome::latLonDist(latitude.x, longitude.x, latitude.y, longitude.y), ## distance in meters
+           rate = dist/(as.numeric(tot_ts)), ## rate of travel in m/s
+           bearing = geosphere::bearing(matrix(c(longitude.x, latitude.x), ncol=2),
+                                   matrix(c(longitude.y, latitude.y), ncol=2)), ## bearing (see package geosphere for help)
+           rhumbline_bearing = geosphere::bearingRhumb(matrix(c(longitude.x, latitude.x), ncol=2),
+                                                  matrix(c(longitude.y, latitude.y), ncol=2))) ## rhumbline bearing (see package geosphere for help)
+  data <- as.data.frame(data)
+  return(data)
+}
+
+```
+
+```{r site transitions}
+transitions <- siteTrans(tags)
+transitions[1:3,]
+```
+
+We are also hoping to add functions for identifying periods of activity, quiescence, or movement, based on signal strength threshholds, and frequency of detections on antennas or stations.
+
+# Data Summaries
+Get overall summary of each tag; first and last detection time, first and last detection site, first and last detection location, total time, distance, overall bearing, and average speed (m/s) between first and last detection, and total number of detections
+```{r summarize tag function, echo = FALSE}
+tagSum <- function(data){
+  tagsum <- data %>% 
+    group_by(mfgID) %>%
+    summarise(first_ts = min(ts),
+              last_ts = max(ts),
+              tot_ts = difftime(max(ts), min(ts), units = "secs"), ## total time in seconds
+              num_det = length(ts)) 
+  tagsum <- left_join(tagsum, select(data, ts, mfgID, deploymentName, latitude, longitude),
+                   by = c("first_ts" = "ts", "mfgID" = "mfgID"))
+  tagsum <- distinct(left_join(tagsum, select(data, ts, mfgID, deploymentName, latitude, longitude),
+                   by = c("last_ts" = "ts", "mfgID" = "mfgID")))
+  tagsum <- rename(tagsum, first_site = deploymentName.x, last_site = deploymentName.y)
+  tagsum <- tagsum %>% 
+    mutate(dist = sensorgnome::latLonDist(latitude.x, longitude.x, latitude.y, longitude.y), ## distance in meters
+           rate = dist/(as.numeric(tot_ts)), ## rate of travel in m/s
+           bearing = bearing(matrix(c(longitude.x, latitude.x), ncol=2), ## bearing (see package geosphere)
+                             matrix(c(longitude.y, latitude.y), ncol=2)))
+  tagsum <- as.data.frame(tagsum)
+  return(tagsum[c("mfgID", "first_ts", "last_ts", "first_site", "last_site", "latitude.x", "longitude.x", "latitude.y", "longitude.y", "tot_ts", "dist", "rate", "bearing", "num_det")])
+}
+```
+
+```{r summarize tag}
+tag_summary <- tagSum(tags)
+head(tag_summary)
+```
+Summarise first and last detections of all tags by site
+```{r tag summaries by site function, echo = FALSE}
+tagSumSite <- function(data, units = "hours"){
+  sitesum <- data %>% 
+    group_by(mfgID, deploymentName) %>% 
+    summarise(first_ts = min(ts),
+              last_ts=max(ts),
+              tot_ts = difftime(max(ts), min(ts), units = units),
+              num_det = length(ts))
+  sitesum <- as.data.frame(sitesum)
+  return(sitesum)
+}
+```
+
+```{r}
+tag_site_summary <- tagSumSite(tags, units = "mins")
+head(tag_site_summary)
+```
+Summarise the detections of all tags by site for each day; first and last detection, total detection time, total number of tags, total number of detections)
+```{r summarize daily detections by site function, echo = FALSE}
+siteSumDaily <- function(data, units = "hours"){
+  sitesum <- data %>%
+    mutate(date = as.Date(ts)) %>% 
+    group_by(deploymentName, date) %>% 
+    summarise(first_ts=min(ts),
+              last_ts=max(ts),
+              tot_ts = difftime(max(ts), min(ts), units = units),
+              num_tags = length(unique(mfgID)),
+              num_det = length(ts))
+  sitesum <- as.data.frame(sitesum)
+}
+```
+
+```{r summarize daily detections by site}
+daily_site_summary <- siteSumDaily(tags, units = "mins")
+head(daily_site_summary)
+```
+Summarize and plot detections of all tags by site, can specify units that total time is displayed in
+```{r plot detection by site summary function, echo = FALSE}
+siteSum <- function(data, deploymentName, mfgID, ts, units = "hours"){
+  sitesum <- data %>%
+    group_by(deploymentName) %>% 
+    summarise(first_ts = min(ts),
+              last_ts = max(ts),
+              tot_ts = difftime(max(ts), min(ts), units = units),
+              num.tags = length(unique(mfgID)),
+              num.det = length(ts))
+  detections <- ggplot(data = sitesum, aes(x = fct_reorder(deploymentName, num.det, .desc = TRUE), y = num.det)) +
+    geom_bar(stat = "identity") + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  ## make x-axis labels on a 45º angle to read more easily
+    labs(title = "Total number of detections per site, across all tags", x= "Site", y = "Total detections") ## changes x- and y-axis label
+  tag <- ggplot(data = sitesum, aes(x = fct_reorder(deploymentName, num.tags, .desc = TRUE), y = num.tags)) + # order site by number of tags
+    geom_bar(stat = "identity") + theme_bw() + ## creates bar plot by site
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ## make x-axis labels on a 45º angle to read more easily
+    labs(title = "Total number of tags detected per site", x= "Site", y = "Number of tags") ## changes x- and y-axis label
+  gridExtra::grid.arrange(detections, tag, nrow = 2)
+  sitesum <- as.data.frame(sitesum)
+  return(sitesum)
+}
+```
+
+```{r plot detection by site summary}
+site_summary <- siteSum(tags, units = "mins")
+head(site_summary)
+```
+Get a dataframe consisting of simultaneous detections at multiple sites
+```{r simultaneous detection function, echo = FALSE}
+simSiteDet <- function(data){
+  data <- group_by(data, mfgID, ts) %>% 
+    mutate(numRec = length(unique(receiverID))) # determine how many unique receiverIDs are in each group of mfgID and ts
+  data <- subset(data, numRec > 1, select = -c(numRec)) # remove groups that are only on 1 receiverID (ie. detections of the same mfgID at the same time, on the same receiver)
+  data <- data[order(data$ts, data$mfgID),]
+  data <- as.data.frame(data)
+  return(data)
+}
+```
+
+```{r simultaneous detection}
+sim <- simSiteDet(tags)
+sim[1:5, c("mfgID", "ts", "sig", "receiverID", "port", "bearing", "gpsLat", "gpsLon")]
+```
+# Data Visualizations
+## Plot Detection data
+Plot all tags by latitude, you can adjust the number of tags visible in each facet
+by adjusting "tagsPerPanel"
+```{r, Plot tags by latitude function, echo = FALSE}
+plotAllTagsLat <- function(data, tagsPerPanel=n){
+  data$round_ts <- as.POSIXct(round(data$ts, "hours")) ## round to the hour
+  data <- data %>%
+    group_by(deploymentName) %>%
+    mutate(meanlat = mean(latitude),
+           meanlat = round(meanlat, digits = 4)) ## get mean latitude
+  ## We want to plot multiple tags per panel, so sort their labels and create a grouping factor
+  ## Note that labels are sorted in increasing order by ID
+  labs = data$mfgID[order(data$mfgID)]
+  dup = duplicated(labs)
+  tagLabs = labs[!dup]
+  tagGroupIDs = data$mfgID[order(data$mfgID)][!dup]
+  tagGroup = 1 + floor((0:length(tagLabs)) / tagsPerPanel)
+  ngroup = length(tagGroup)
+  names(tagGroup) = tagLabs
+  tagGroupFactor = tagGroup[as.character(data$mfgID)]
+  tagGroupLabels = tapply(tagGroupIDs, 1 + floor((0:(length(tagGroupIDs)-1)) / tagsPerPanel), function(data) paste("IDs:", paste(sort(unique(data)), collapse=",")))
+  data$tagGroupFactor = factor(tagGroupFactor, labels=tagGroupLabels, ordered=TRUE)
+  data <- unique(select(data, round_ts, meanlat, deploymentName, mfgID, tagGroupFactor)) ## get unique hourly detections for small dataframe
+  data <- data[order(data$round_ts),] ## order by time
+  out <- by(data, INDICES = data$tagGroupFactor, FUN = function(m){
+    m <- droplevels(m)
+    m <- ggplot(m, aes(round_ts, meanlat, colour = mfgID, group = mfgID))
+    m + geom_line() + geom_point(pch = 21) + theme_bw() +
+      labs(title = "Detection time vs Latitude by Tag", x = "Date", y = "Latitude", colour = "ID") +
+      facet_wrap("tagGroupFactor")
+  })
+  do.call(gridExtra::grid.arrange, out)
+}
+```
+
+```{r Plot all tags by latitude, warning = FALSE}
+plotAllTagsLat(tags, tagsPerPanel = 4)
+```
+
+Plot all detections of a specified tag by site
+```{r plot tag by site function, echo = FALSE}
+plotTagSig <- function(data, tag){
+  data <- data %>% mutate(deploymentName = fct_reorder(deploymentName, latitude)) ## order site by latitude
+  data <-  select(data, ts, sig, port, mfgID, deploymentName) %>% filter(mfgID == tag) %>% distinct ## get unique hourly detections for small dataframe
+  p <- ggplot(data, aes(ts, sig, col = as.factor(port)))
+  p + geom_point() + theme_bw() + labs(title = paste("Detection Time vs Signal Strength, coloured by antenna \n ID ", tag), x = "Date", y = "Signal Strength", colour = "Antenna") +
+    facet_grid(deploymentName~.) + theme(strip.text.y = element_text(angle=0))
+}
+```
+
+```{r plot tag by site}
+plotTagSig(tags, tag = 94)
+```
+
+Plot all tags by site, you can adjust the number of tags visible in each facet
+by adjusting "tagsPerPanel"
+```{r Plot tags by site function, echo = FALSE}
+plotAllTagsSite <- function(data, tagsPerPanel = n){
+  data$round_ts <- as.POSIXct(round(data$ts, "hours")) ## round to the hour
+  data <- data %>%
+    group_by(deploymentName) %>%
+    mutate(meanlat = mean(latitude)) ## get mean latitude
+  data <- data %>% mutate(meanlat = round(meanlat, digits = 4),
+                 sitelat = as.factor(paste(deploymentName, meanlat, sep = " ")))
+  data <- within(data, sitelat <- reorder(sitelat, (latitude))) ## order sitelat by latitude
+  ## We want to plot multiple data per panel, so sort their labels and create a grouping factor
+  ## Note that labels are sorted in increasing order by ID
+  labs = data$mfgID[order(data$mfgID)]
+  dup = duplicated(labs)
+  tagLabs = labs[!dup]
+  tagGroupIDs = data$mfgID[order(data$mfgID)][!dup]
+  tagGroup = 1 + floor((0:length(tagLabs)) / tagsPerPanel)
+  ngroup = length(tagGroup)
+  names(tagGroup) = tagLabs
+  tagGroupFactor = tagGroup[as.character(data$mfgID)]
+  tagGroupLabels = tapply(tagGroupIDs, 1 + floor((0:(length(tagGroupIDs)-1)) / tagsPerPanel), function(data) paste("IDs:", paste(sort(unique(data)), collapse=",")))
+  data$tagGroupFactor = factor(tagGroupFactor, labels=tagGroupLabels, ordered=TRUE)
+  data <- unique(select(data, round_ts, meanlat, sitelat, mfgID, tagGroupFactor)) ## get unique hourly detections for small dataframe
+  data <- data[order(data$round_ts),] ## order by time
+  out <- by(data, INDICES = data$tagGroupFactor, FUN = function(m){
+    m <- droplevels(m)
+    m <- ggplot(m, aes(round_ts, sitelat, colour = mfgID, group = mfgID))
+    p <- ggplot(data, aes(round_ts, sitelat, col = mfgID, group = mfgID))
+    m + geom_line() + geom_point(pch = 21) + theme_bw() +
+      labs(title = "Detection time vs Site (ordered by latitude) by Tag", x = "Date", y = "Latitude", colour = "ID") +
+      facet_wrap("tagGroupFactor")
+  })
+  do.call(gridExtra::grid.arrange, out)
+}
+```
+
+```{r plot tags by site, warning = FALSE}
+plotAllTagsSite(tags, tagsPerPanel = 2)
+```
+
+Plot all detections at a specified site
+```{r site detections function, echo = FALSE}
+plotSite <- function(data, depName = unique(data$deploymentName)){
+  data$round_ts <- as.POSIXct(round(data$ts, "hours")) ## round to the hour
+#  data$port <- sub("\\s+$", "", dat$port) ## remove blank spaces at the end of some antenna values
+  data <-  data %>% filter(deploymentName == depName) %>% select(round_ts, port, bearing, mfgID) %>% distinct ## get unique hourly detections for small dataframe
+  p <- ggplot(data, aes(mfgID, round_ts, colour = as.factor(bearing)))
+  p + geom_point(position=position_dodge(width = .2)) + theme_bw() + labs(title = "Detection Time vs Tag ID, coloured by antenna", x = "Tag ID", y = "Date", colour = "Antenna") +
+  coord_flip()
+}
+```
+
+```{r site detections, warnings = FALSE}
+plotSite(tags, depName = "Piskwamish")
+```
+
+Plot signal strength of all tags at a specified site
+```{r signal strength by site function, echo = FALSE}
+plotSiteSig <- function(data, depName = unique(data$deploymentName)){
+  data <-  data %>% filter(deploymentName == depName) %>% select(ts, sig, bearing, port, mfgID) %>% distinct ## get unique hourly detections for small dataframe
+  p <- ggplot(data, aes(ts, sig, colour = as.factor(bearing)))
+  p + geom_point() + theme_bw() + labs(title = "Detection Time vs Signal Strength by Tag ID, coloured by antenna", x = "Date", y = "Signal Strength", colour = "Antenna") +
+    facet_wrap(~mfgID)
+}
+```
+
+```{r signal strength by site}
+plotSiteSig(tags, depName = "Piskwamish")
+```
+
+## Plot site detection summaries
+Plot the total number of detections across all tags, and the total number of tag detected per day for a specified site.
+```{r plot detection summaries by site function, echo = FALSE}
+siteSumDaily <- function(data, units = "hours"){
+  data$date <- as.Date(data$ts)
+  data <- data %>% 
+    group_by(deploymentName, date) %>% 
+    summarise(first_ts=min(ts),
+              last_ts=max(ts),
+              tot_ts = difftime(max(ts), min(ts), units = units),
+              num_det = length(ts),
+              num_tags = length(unique(mfgID)))
+  }
+
+plotDailySiteSum <- function(data, Site){
+  sitesum <- siteSumDaily(filter(data, deploymentName == Site))
+  detections <- ggplot(sitesum, aes(date, num_det)) +
+    geom_bar(stat = "identity") + theme_bw() + ## creates bar plot by deployment name
+    labs(x= "Date", y = "Total detections")
+  tagsplot <- ggplot(sitesum, aes(date, num_tags)) +
+    geom_bar(stat = "identity") + theme_bw() + ## creates line graph by deployment name
+    labs(x= "Date", y = "Number of tags")
+  gridExtra::grid.arrange(detections, tagsplot, nrow = 2, top = paste("Daily number of detections and tags at", Site, sep = " "))
+}
+```
+
+```{r plot detection summaries by site, warnings = FALSE}
+plotDailySiteSum(tags, Site = "Piskwamish")
+```
+
+## Plot Route Maps
+Plot route estimates coloured by ID, with all sites. You can specify maptype (terrain, satellite, roadmap, hybrid), map center (latCentre/lonCentre), zoom, and the time frame for active receivers to be displayed.
+```{r, route maps and sites by ID function, echo = FALSE}
+plotRouteMap <- function(site_data, detection_data, zoom, latCentre, lonCentre,
+                         maptype = c("satellite", "terrain", "hybrid", "roadmap"), startTime, endTime){
+  site_data <- site_data %>% mutate(dtStart = ymd_hms(dtStart),
+                                    dtEnd = ifelse(dtEnd == "", ymd_hms(Sys.time()) + dyears(1), ymd_hms(dtEnd)),
+                                    dtEnd = as_datetime(dtEnd, tz = "UTC")) ## for sites with no end date, make an end date a year from now (this is for )
+  site_data <- unique(select(site_data, deploymentName, latitude, longitude, dtStart, dtEnd))
+  siteOp <- with(site_data, lubridate::interval(dtStart, dtEnd)) ## get running intervals for each deployment
+  dateRange <- lubridate::interval(as.POSIXct(startTime), as.POSIXct(endTime)) ## get time interval you are interested in
+  site_data$include <- lubridate::int_overlaps(siteOp, dateRange) ## if include == TRUE then the intervals overlapped and the site was "running" at some point during the specified time
+  detection_data <- detection_data[order(detection_data$ts),] ## order by time
+  gmap <-  ggmap::get_map(location = c(lon = lonCentre, lat = latCentre), ## lon/lat to centre map over
+                   maptype = maptype, ## select maptype
+                   source = "google",
+                   zoom = zoom) ## zoom, must be a whole number
+  p <- ggmap(gmap)
+  p + geom_point(data = subset(site_data, include == TRUE), aes(longitude, latitude), pch=21, colour = "black", fill = "yellow") +
+    geom_path(data=detection_data, aes(longitude, latitude, group=mfgID, col = mfgID)) +
+    labs(x = "Longitude", y = "Latitude") + theme_bw()
+}
+```
+
+```{r route maps and sites by ID, warning = FALSE, message = FALSE}
+plotRouteMap(site_data = rec, detection_data = tags, maptype = "terrain",
+latCentre = 44, lonCentre = -70, zoom = 5, startTime = "2016-01-01", endTime = "2016-12-31")
+```
+
+
+We are also hoping to add functions for station operation plots (active/inactive periods for stations, antenna, and gps), as well as maps of receivers active during a specified time period including antenna directions and range estimates.
+
+After reviewing these functions, are there any other tools that you would like to see included? If already have scripts for other tools and would like to contribute to the R package, please let us know at motus@birdscanada.org
